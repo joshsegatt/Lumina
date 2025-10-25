@@ -5,12 +5,14 @@ import { TopBar } from './components/TopBar';
 import { HistoryScreen } from './components/HistoryScreen';
 import { SettingsScreen } from './components/SettingsScreen';
 import { Header } from './components/Header';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { FEATURES, MODELS, LOCAL_MODEL_CONFIG } from './constants';
 import type { Feature, LlmStatus, LlmModelConfig, Screen, Conversation, ChatMessage } from './types';
-import { llmService } from './services/llmService';
+import { llmService } from './services/llmServiceAdapter';
 import { I18nProvider, useI18n } from './services/i18n';
 import { useConversationManager } from './services/conversationManager';
 import { ThemeProvider } from './services/themeManager';
+import { logVersionInfo } from './version';
 
 const SplashScreen: React.FC = () => {
     return (
@@ -45,13 +47,16 @@ const UploadIcon = (props: React.ComponentProps<'svg'>) => (
 );
 
 
-const ModelCard: React.FC<{ model: LlmModelConfig, onSelect: () => void, buttonText: string }> = ({ model, onSelect, buttonText }) => (
-  <div className="bg-slate-100 dark:bg-slate-800/50 p-6 rounded-2xl border border-slate-300 dark:border-slate-700/50 flex flex-col text-left">
+const ModelCard: React.FC<{ model: LlmModelConfig, onSelect: () => void, buttonText: string, disabled?: boolean }> = ({ model, onSelect, buttonText, disabled = false }) => (
+  <div className={`bg-slate-100 dark:bg-slate-800/50 p-6 rounded-2xl border border-slate-300 dark:border-slate-700/50 flex flex-col text-left ${disabled ? 'opacity-50' : ''}`}>
     <h3 className="text-xl font-bold text-slate-900 dark:text-slate-100">{model.displayName}</h3>
     <p className="text-slate-500 dark:text-slate-400 mb-4">Approx. Size: {model.size}</p>
     <button
       onClick={onSelect}
-      className="mt-auto bg-violet-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-violet-500 transition-all duration-300 flex items-center justify-center gap-2"
+      disabled={disabled}
+      className={`mt-auto bg-violet-600 text-white font-bold py-2 px-4 rounded-lg transition-all duration-300 flex items-center justify-center gap-2 ${
+        disabled ? 'cursor-not-allowed opacity-50' : 'hover:bg-violet-500'
+      }`}
     >
       <DownloadIcon className="w-5 h-5" />
       {buttonText}
@@ -66,7 +71,8 @@ const ModelSelectionScreen: React.FC<{
   selectedModelName: string | null;
   onSelectModel: (modelId: string) => void;
   onLoadLocalFile: () => void;
-}> = ({ status, progress, message, selectedModelName, onSelectModel, onLoadLocalFile }) => {
+  onReset: () => void;
+}> = ({ status, progress, message, selectedModelName, onSelectModel, onLoadLocalFile, onReset }) => {
   const { t } = useI18n();
   return (
     <div className="flex flex-col items-center justify-center min-h-screen-minus-header py-4">
@@ -85,7 +91,7 @@ const ModelSelectionScreen: React.FC<{
             </div>
             <p className="text-sm text-slate-500 dark:text-slate-400">{message}</p>
             <button
-                onClick={() => window.location.reload()}
+                onClick={onReset}
                 className="mt-6 bg-slate-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-600 dark:bg-slate-600 dark:hover:bg-slate-500 transition-colors"
             >
                 {t('cancel')}
@@ -96,7 +102,38 @@ const ModelSelectionScreen: React.FC<{
             <p className="text-red-800 dark:text-red-300 font-semibold">{t('engineFail')}</p>
             <p className="text-red-600 dark:text-red-400 text-sm mt-1">{message}</p>
             <button
-                onClick={() => window.location.reload()}
+                onClick={onReset}
+                className="mt-4 bg-slate-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-600 dark:bg-slate-600 dark:hover:bg-slate-500 transition-colors"
+            >
+                {t('tryAgain')}
+            </button>
+          </div>
+        ) : (status === 'failed_engine' || status === 'failed_download' || status === 'failed_validation') ? (
+          <div className="mt-4 p-4 bg-red-100 dark:bg-red-900/50 border border-red-300 dark:border-red-500/50 rounded-lg max-w-lg mx-auto">
+            <p className="text-red-800 dark:text-red-300 font-semibold">
+              {status === 'failed_engine' && '⚠️ Engine Initialization Failed'}
+              {status === 'failed_download' && '⚠️ Download Failed'}
+              {status === 'failed_validation' && '⚠️ Validation Failed'}
+            </p>
+            <p className="text-red-600 dark:text-red-400 text-sm mt-2 whitespace-pre-wrap font-mono max-h-48 overflow-y-auto">
+              {message}
+            </p>
+            {status === 'failed_engine' && (
+              <details className="mt-3">
+                <summary className="text-red-700 dark:text-red-400 text-sm cursor-pointer font-semibold">
+                  🔧 Troubleshooting Steps
+                </summary>
+                <ul className="text-red-600 dark:text-red-400 text-xs mt-2 space-y-1 list-disc list-inside">
+                  <li>Check device logs: <code className="bg-red-200 dark:bg-red-800 px-1">adb logcat | grep llama</code></li>
+                  <li>Verify model file downloaded completely (check size matches)</li>
+                  <li>Ensure sufficient device RAM available (&gt;2GB free recommended)</li>
+                  <li>Try clearing app cache: Settings → Apps → Lumina → Clear Cache</li>
+                  <li>Restart device and try again</li>
+                </ul>
+              </details>
+            )}
+            <button
+                onClick={onReset}
                 className="mt-4 bg-slate-700 text-white font-bold py-2 px-4 rounded-lg hover:bg-slate-600 dark:bg-slate-600 dark:hover:bg-slate-500 transition-colors"
             >
                 {t('tryAgain')}
@@ -107,7 +144,15 @@ const ModelSelectionScreen: React.FC<{
             <h2 className="text-3xl font-bold text-slate-800 dark:text-slate-100 mt-8 mb-2">{t('modelSelection')}</h2>
             <p className="text-slate-500 dark:text-slate-400 mb-8 max-w-lg mx-auto">{t('modelDescription')}</p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-               {MODELS.map(model => <ModelCard key={model.id} model={model} onSelect={() => onSelectModel(model.id)} buttonText={t('loadModel')} />)}
+               {MODELS.map(model => (
+                 <ModelCard 
+                   key={model.id} 
+                   model={model} 
+                   onSelect={() => onSelectModel(model.id)} 
+                   buttonText={t('loadModel')}
+                   disabled={status === 'downloading' || status === 'validating' || status === 'initializing'}
+                 />
+               ))}
             </div>
             <div className="my-8 text-center text-slate-500 dark:text-slate-400">OR</div>
             <div className="max-w-md mx-auto">
@@ -116,7 +161,10 @@ const ModelSelectionScreen: React.FC<{
                     <p className="text-slate-500 dark:text-slate-400 mb-4">{t('loadFromDeviceDescription')}</p>
                     <button
                         onClick={onLoadLocalFile}
-                        className="mt-auto bg-sky-600 text-white font-bold py-2 px-4 rounded-lg hover:bg-sky-500 transition-all duration-300 flex items-center justify-center gap-2"
+                        disabled={status === 'downloading' || status === 'validating' || status === 'initializing'}
+                        className={`mt-auto bg-sky-600 text-white font-bold py-2 px-4 rounded-lg transition-all duration-300 flex items-center justify-center gap-2 ${
+                          (status === 'downloading' || status === 'validating' || status === 'initializing') ? 'cursor-not-allowed opacity-50' : 'hover:bg-sky-500'
+                        }`}
                     >
                         <UploadIcon className="w-5 h-5" />
                         {t('chooseFile')}
@@ -141,12 +189,36 @@ const AppContent: React.FC = () => {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const loadingAbortControllerRef = useRef<AbortController | null>(null);
   const { t } = useI18n();
   const { conversations, createConversation, updateConversation, deleteConversation, clearAllConversations } = useConversationManager();
+
+  // Reset app state (replaces window.location.reload() for React Native compatibility)
+  const resetApp = () => {
+    console.log('[App] 🔄 Resetting application state...');
+    
+    // Cancel any ongoing model load
+    if (loadingAbortControllerRef.current) {
+      loadingAbortControllerRef.current.abort();
+      loadingAbortControllerRef.current = null;
+    }
+    
+    setLlmStatus('idle');
+    setSelectedModelId(null);
+    setLoadProgress(0);
+    setLoadMessage('');
+    setScreen('model-selection');
+    setActiveConversationId(null);
+  };
   
   useEffect(() => {
     const timer = setTimeout(() => setIsSplashing(false), 1800);
     return () => clearTimeout(timer);
+  }, []);
+  
+  // Log version info on mount to confirm fresh bundle
+  useEffect(() => {
+    logVersionInfo();
   }, []);
   
   const activeConversation = useMemo(() => {
@@ -154,22 +226,109 @@ const AppContent: React.FC = () => {
   }, [conversations, activeConversationId]);
   
   const handleLoadModel = async (modelId: string) => {
+    // RACE CONDITION GUARD: Prevent concurrent model loads
+    if (llmStatus === 'loading' || llmStatus === 'downloading' || llmStatus === 'validating' || llmStatus === 'initializing') {
+      console.warn('[App] ⚠️ Model already loading, ignoring request');
+      return;
+    }
+    
+    // Cancel any previous load attempt
+    if (loadingAbortControllerRef.current) {
+      console.log('[App] Cancelling previous load...');
+      loadingAbortControllerRef.current.abort();
+    }
+    
+    // Create new abort controller for this load
+    loadingAbortControllerRef.current = new AbortController();
+    const currentLoadController = loadingAbortControllerRef.current;
+    
     setSelectedModelId(modelId);
     setLlmStatus('loading');
+    
     try {
       const modelConfig = MODELS.find(m => m.id === modelId);
       if (!modelConfig) throw new Error("Model configuration not found.");
 
+      // Check if load was cancelled
+      if (currentLoadController.signal.aborted) {
+        console.log('[App] Load cancelled before starting');
+        return;
+      }
+
+      // HuggingFace token moved to environment for security
+      // SECURITY FIX: Never commit tokens to source control
+      // Set VITE_HF_TOKEN in your .env.local file
+      // Get token from: https://huggingface.co/settings/tokens
+      const HF_TOKEN = (import.meta as any).env?.VITE_HF_TOKEN || '';
+      
+      if (!HF_TOKEN) {
+        console.warn('[App] ⚠️ No HF_TOKEN found. Downloads may be rate-limited.');
+        console.warn('[App] Set VITE_HF_TOKEN in .env.local to avoid rate limits.');
+      }
+      
       await llmService.loadModel(modelConfig, (progress, message) => {
+        // Check if load was cancelled during progress
+        if (currentLoadController.signal.aborted) {
+          console.log('[App] Load cancelled during progress');
+          return;
+        }
+        
+        console.log(`[App] Progress: ${progress}% - ${message}`);
+        
+        // Mapeia progresso para estados específicos
+        if (progress < 70) {
+          setLlmStatus('downloading');
+        } else if (progress >= 70 && progress < 85) {
+          setLlmStatus('validating');
+        } else if (progress >= 85 && progress < 100) {
+          setLlmStatus('initializing');
+        }
+        
         setLoadProgress(progress);
         setLoadMessage(message);
-      });
+      }, HF_TOKEN);
+      
+      // Check if load was cancelled after completion
+      if (currentLoadController.signal.aborted) {
+        console.log('[App] Load cancelled after completion');
+        return;
+      }
+      
       setLlmStatus('ready');
+      loadingAbortControllerRef.current = null; // Clear controller on success
       handleNewChat(modelId);
     } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      // Check if error was due to cancellation
+      if (currentLoadController.signal.aborted) {
+        console.log('[App] Load properly cancelled');
+        return;
+      }
+      
+      loadingAbortControllerRef.current = null; // Clear controller on error
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      
+      // Detectar tipo específico de erro
+      console.error('[App] ========== LOAD MODEL FAILED ==========');
+      console.error('[App] Error message:', errorMessage);
+      console.error('[App] Full error:', error);
+      
+      if (errorMessage.toLowerCase().includes('download')) {
+        console.error('[App] Error type: DOWNLOAD FAILURE');
+        setLlmStatus('failed_download');
+      } else if (errorMessage.toLowerCase().includes('validation') || errorMessage.toLowerCase().includes('sha256') || errorMessage.toLowerCase().includes('hash')) {
+        console.error('[App] Error type: VALIDATION FAILURE');
+        setLlmStatus('failed_validation');
+      } else if (errorMessage.toLowerCase().includes('engine') || errorMessage.toLowerCase().includes('initllama') || errorMessage.toLowerCase().includes('initialization')) {
+        console.error('[App] Error type: ENGINE INITIALIZATION FAILURE');
+        setLlmStatus('failed_engine');
+      } else {
+        console.error('[App] Error type: GENERIC ERROR');
         setLlmStatus('error');
-        setLoadMessage(errorMessage);
+      }
+      
+      setLoadMessage(errorMessage);
+      console.error('[App] Status set to:', llmStatus);
+      console.error('[App] ==========================================');
     }
   };
   
@@ -221,7 +380,7 @@ const AppContent: React.FC = () => {
   };
   
   const handleDeleteConversation = (id: string) => {
-      deleteConversation(id, t('deleteConfirm'));
+      deleteConversation(id, t('deleteConfirm'), async (message: string) => window.confirm(message));
       if (activeConversationId === id) {
           setActiveConversationId(null);
           setScreen('history');
@@ -235,7 +394,7 @@ const AppContent: React.FC = () => {
   };
   
   const handleClearHistory = () => {
-      clearAllConversations(t('clearHistoryConfirm'));
+      clearAllConversations(t('clearHistoryConfirm'), async (message: string) => window.confirm(message));
       setActiveConversationId(null);
       setScreen('history');
   }
@@ -244,7 +403,7 @@ const AppContent: React.FC = () => {
       if(window.confirm(t('clearCacheConfirm'))) {
           await llmService.clearCache();
           alert(t('cacheCleared'));
-          window.location.reload();
+          resetApp();
       }
   }
 
@@ -258,30 +417,50 @@ const AppContent: React.FC = () => {
                         selectedModelName={selectedModelName}
                         onSelectModel={handleLoadModel}
                         onLoadLocalFile={handleLoadLocalFile}
+                        onReset={resetApp}
                       />
            }
-          return <ChatWindow 
-                    conversation={activeConversation}
-                    onBack={() => { setActiveConversationId(null); setScreen('history'); }}
-                    onMessagesUpdate={handleMessagesUpdate}
-                 />;
+          return (
+            <ErrorBoundary 
+              fallbackTitle={t('errorInChat')}
+              onReset={() => {
+                console.log('[App] Resetting chat after error...');
+                setActiveConversationId(null);
+                setScreen('history');
+              }}
+            >
+              <ChatWindow 
+                conversation={activeConversation}
+                onBack={() => { setActiveConversationId(null); setScreen('history'); }}
+                onMessagesUpdate={handleMessagesUpdate}
+              />
+            </ErrorBoundary>
+          );
       }
       switch (screen) {
           case 'history':
-              return <HistoryScreen 
-                        conversations={conversations}
-                        onSelectConversation={handleSelectConversation}
-                        onDeleteConversation={handleDeleteConversation}
-                        onNewChat={handleNewChat}
-                        onClearAll={handleClearHistory}
-                     />;
+              return (
+                <ErrorBoundary fallbackTitle={t('errorInHistory')}>
+                  <HistoryScreen 
+                    conversations={conversations}
+                    onSelectConversation={handleSelectConversation}
+                    onDeleteConversation={handleDeleteConversation}
+                    onNewChat={handleNewChat}
+                    onClearAll={handleClearHistory}
+                  />
+                </ErrorBoundary>
+              );
           case 'settings':
-              return <SettingsScreen 
-                        activeModelId={selectedModelId}
-                        onClearHistory={handleClearHistory}
-                        onClearCache={handleClearCache}
-                        onNavigate={setScreen}
-                     />;
+              return (
+                <ErrorBoundary fallbackTitle={t('errorInSettings')}>
+                  <SettingsScreen 
+                    activeModelId={selectedModelId}
+                    onClearHistory={handleClearHistory}
+                    onClearCache={handleClearCache}
+                    onNavigate={setScreen}
+                  />
+                </ErrorBoundary>
+              );
           case 'model-selection':
              return <ModelSelectionScreen 
                         status={llmStatus === 'loading' || llmStatus === 'error' ? llmStatus : 'idle'}
@@ -290,12 +469,15 @@ const AppContent: React.FC = () => {
                         selectedModelName={selectedModelName}
                         onSelectModel={handleLoadModel}
                         onLoadLocalFile={handleLoadLocalFile}
+                        onReset={resetApp}
                       />
       }
   };
   
   const allModels = [...MODELS, LOCAL_MODEL_CONFIG];
-  const selectedModelName = selectedModelId ? allModels.find(m => m.id === selectedModelId)?.displayName : null;
+  const selectedModelName = selectedModelId 
+    ? (allModels.find(m => m.id === selectedModelId)?.displayName ?? null)
+    : null;
 
   return (
     <div className="bg-slate-50 text-slate-800 dark:bg-slate-900 dark:text-white min-h-screen">
@@ -318,11 +500,13 @@ const AppContent: React.FC = () => {
 };
 
 const App: React.FC = () => (
-  <I18nProvider>
-    <ThemeProvider>
-      <AppContent />
-    </ThemeProvider>
-  </I18nProvider>
+  <ErrorBoundary fallbackTitle="Application Error">
+    <I18nProvider>
+      <ThemeProvider>
+        <AppContent />
+      </ThemeProvider>
+    </I18nProvider>
+  </ErrorBoundary>
 );
 
 export default App;

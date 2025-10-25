@@ -1,7 +1,9 @@
 import React, { createContext, useState, useContext, useEffect, ReactNode, useCallback } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { Theme } from '../types';
 
-const THEME_STORAGE_KEY = 'lumina-theme';
+const THEME_STORAGE_KEY = '@lumina:theme';
+const STORAGE_KEY = '@lumina:theme'; // For useTheme hook compatibility
 
 interface ThemeContextType {
   theme: Theme;
@@ -26,16 +28,30 @@ export const ThemeProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   }, []);
 
   useEffect(() => {
-    const storedTheme = localStorage.getItem(THEME_STORAGE_KEY) as Theme | null;
-    const initialTheme = storedTheme || 'system';
-    setThemeState(initialTheme);
-    applyTheme(initialTheme);
+    const initTheme = async () => {
+      try {
+        const storedTheme = await AsyncStorage.getItem(THEME_STORAGE_KEY) as Theme | null;
+        const initialTheme = storedTheme || 'system';
+        setThemeState(initialTheme);
+        applyTheme(initialTheme);
+      } catch (error) {
+        console.error('[ThemeProvider] Failed to load theme:', error);
+        setThemeState('system');
+        applyTheme('system');
+      }
+    };
+    
+    initTheme();
   }, [applyTheme]);
   
-  const setTheme = (newTheme: Theme) => {
+  const setTheme = async (newTheme: Theme) => {
     setThemeState(newTheme);
-    localStorage.setItem(THEME_STORAGE_KEY, newTheme);
-    applyTheme(newTheme);
+    try {
+      await AsyncStorage.setItem(THEME_STORAGE_KEY, newTheme);
+      applyTheme(newTheme);
+    } catch (error) {
+      console.error('[ThemeProvider] Failed to save theme:', error);
+    }
   };
   
   useEffect(() => {
@@ -55,10 +71,11 @@ export const ThemeProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   return React.createElement(ThemeContext.Provider, { value: { theme, setTheme } }, children);
 };
 
-export const useTheme = () => {
+// Export hook to use theme context
+export function useTheme() {
   const context = useContext(ThemeContext);
-  if (context === undefined) {
+  if (!context) {
     throw new Error('useTheme must be used within a ThemeProvider');
   }
   return context;
-};
+}

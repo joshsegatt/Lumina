@@ -4,10 +4,10 @@ import type React from 'react';
 export type Screen = 'chat' | 'history' | 'settings' | 'model-selection';
 
 // NEW: For i18n
-export type LanguageCode = 'en' | 'pt' | 'es' | 'fr' | 'de' | 'ja';
+export type LanguageCode = 'en' | 'pt' | 'es' | 'fr' | 'de' | 'ja' | 'zh';
 export interface Language {
-    code: LanguageCode;
-    name: string;
+    id: LanguageCode;
+    label: string;
 }
 
 // NEW: For Theme Management
@@ -44,14 +44,26 @@ export interface Conversation {
 }
 
 
-export type LlmStatus = 'idle' | 'loading' | 'ready' | 'error';
+export type LlmStatus = 
+  | 'idle'              // Nenhum modelo selecionado
+  | 'loading'           // Estado inicial (genérico)
+  | 'downloading'       // Baixando arquivo do HF
+  | 'validating'        // Validando SHA256
+  | 'initializing'      // Carregando no engine (initLlama)
+  | 'ready'             // Pronto para gerar texto
+  | 'error'             // Falha genérica
+  | 'failed_download'   // Download falhou
+  | 'failed_validation' // Validação falhou (SHA256 mismatch)
+  | 'failed_engine';    // Engine init falhou (crítico)
 
-export interface LlmModelConfig {
+export interface LlmModelMetadata {
   id: string;
   displayName: string;
-  size: string;
-  // NEW: Fields for robust model downloading
   url: string;
+  sha256: string;
+}
+
+export interface LlmModelConfig extends LlmModelMetadata {
+  size: string;
   sizeBytes: number;
-  sha256: string; // Placeholder for integrity check
 }

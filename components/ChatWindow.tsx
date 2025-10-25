@@ -1,6 +1,6 @@
-import React, { useState, useRef, useEffect, FormEvent } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo, FormEvent } from 'react';
 import type { Conversation, ChatMessage } from '../types';
-import { llmService } from '../services/llmService';
+import { llmService } from '../services/llmServiceAdapter';
 
 const BackArrowIcon = (props: React.ComponentProps<'svg'>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" {...props}>
@@ -26,20 +26,42 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ conversation, onBack, on
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Sync local state if conversation prop changes
   useEffect(() => {
-    // Sync local state if conversation prop changes
     setMessages(conversation.messages);
-  }, [conversation]);
+  }, [conversation.id]); // Only re-sync when conversation ID changes
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  // Debounced scroll to bottom (prevents excessive scroll calls)
+  const scrollToBottom = useCallback(() => {
+    // Clear any pending scroll
+    if (scrollTimeoutRef.current) {
+      clearTimeout(scrollTimeoutRef.current);
+    }
+    
+    // Schedule new scroll
+    scrollTimeoutRef.current = setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      scrollTimeoutRef.current = null;
+    }, 100);
+  }, []);
 
+  // Cleanup scroll timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (scrollTimeoutRef.current) {
+        clearTimeout(scrollTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  // Scroll when messages change
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [messages.length, scrollToBottom]); // Only when message count changes
 
+  // Auto-resize textarea
   useEffect(() => {
     if (textareaRef.current) {
         textareaRef.current.style.height = 'auto';
@@ -47,9 +69,22 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ conversation, onBack, on
     }
   }, [input]);
 
-  const handleSubmit = async (e: FormEvent) => {
+  const handleSubmit = useCallback(async (e: FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
+
+    // CRÍTICO: Verificar se engine está realmente pronto
+    if (!llmService.isReady()) {
+      console.error('[ChatWindow] ❌ Attempted to generate text but engine is not ready');
+      alert('O modelo ainda não está carregado. Por favor, aguarde o carregamento completo.');
+      return;
+    }
+    
+    console.log('[ChatWindow] ✅ Engine ready check passed');
+
+    console.log('[ChatWindow] Starting message generation...');
+    console.log('[ChatWindow] User input:', input);
+    console.log('[ChatWindow] System instruction:', conversation.feature.systemInstruction.substring(0, 50) + '...');
 
     const userMessage: ChatMessage = { role: 'user', text: input };
     const newMessages = [...messages, userMessage];
@@ -62,26 +97,63 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ conversation, onBack, on
     // Add placeholder for streaming
     setMessages(prev => [...prev, { role: 'model', text: '' }]);
 
-    await llmService.generateStream(
-      conversation.feature.systemInstruction,
-      currentInput,
-      (chunk) => {
-        setMessages(prev => {
-          const updated = [...prev];
-          updated[updated.length - 1].text = chunk;
-          return updated;
-        });
-      },
-      () => {
-        setIsLoading(false);
-        // Persist final messages after stream finishes
-        setMessages(prev => {
-            onMessagesUpdate(prev);
-            return prev;
-        });
-      }
-    );
-  };
+    console.log('[Chat] ========== GENERATION START ==========');
+    console.log('[Chat] User message length:', currentInput.length, 'chars');
+    console.log('[Chat] System instruction length:', conversation.feature.systemInstruction.length, 'chars');
+    console.log('[Chat] Total messages in conversation:', newMessages.length);
+    
+    const startTime = Date.now();
+    let tokenCount = 0;
+
+    try {
+      await llmService.generateStream(
+        conversation.feature.systemInstruction,
+        currentInput,
+        (chunk) => {
+          tokenCount++;
+          if (tokenCount % 10 === 0) {
+            const elapsed = (Date.now() - startTime) / 1000;
+            const tokensPerSecond = elapsed > 0 ? (tokenCount / elapsed).toFixed(1) : '0';
+            console.log(`[Chat] Progress: ${tokenCount} tokens, ${tokensPerSecond} tok/s`);
+          }
+          
+          setMessages(prev => {
+            const updated = [...prev];
+            updated[updated.length - 1].text = chunk;
+            return updated;
+          });
+        },
+        () => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const tokensPerSecond = elapsed > 0 ? (tokenCount / elapsed).toFixed(1) : '0';
+          
+          console.log('[Chat] ========== GENERATION COMPLETE ==========');
+          console.log(`[Chat] Total tokens: ${tokenCount}`);
+          console.log(`[Chat] Duration: ${elapsed.toFixed(2)}s`);
+          console.log(`[Chat] Speed: ${tokensPerSecond} tokens/s`);
+          
+          setIsLoading(false);
+          console.log('[ChatWindow] ✅ Generation completed successfully');
+          // Persist final messages after stream finishes
+          setMessages(prev => {
+              onMessagesUpdate(prev);
+              return prev;
+          });
+        }
+      );
+    } catch (error: any) {
+      console.error('[Chat] ❌ Generation failed:', error);
+      console.error('[Chat] Error type:', error.constructor?.name);
+      console.error('[Chat] Error message:', error.message);
+      setIsLoading(false);
+      // Show error in chat
+      setMessages(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1].text = `Erro ao gerar resposta: ${error.message || error}`;
+        return updated;
+      });
+    }
+  }, [input, isLoading, messages, conversation.feature.systemInstruction, onMessagesUpdate]);
 
   return (
     <div className="flex flex-col w-full py-4 min-h-screen-minus-header">
@@ -133,14 +205,14 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ conversation, onBack, on
               }
             }}
             placeholder={conversation.feature.placeholder}
-            disabled={isLoading}
+            disabled={isLoading || !llmService.isReady()}
             rows={1}
-            className="w-full bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-2xl py-3 pl-5 pr-14 text-slate-900 dark:text-slate-200 placeholder-slate-400 dark:placeholder-slate-500 focus:ring-2 focus:ring-violet-500 focus:border-violet-500 outline-none transition-all duration-300 resize-none overflow-y-hidden"
+            className="w-full bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-2xl py-3 pl-5 pr-14 text-slate-900 dark:text-slate-200 placeholder-slate-400 dark:placeholder-slate-500 focus:ring-2 focus:ring-violet-500 focus:border-violet-500 outline-none transition-all duration-300 resize-none overflow-y-hidden disabled:opacity-50 disabled:cursor-not-allowed"
             style={{paddingTop: '0.8rem', paddingBottom: '0.8rem', lineHeight: '1.5rem', maxHeight: '120px'}}
           />
           <button
             type="submit"
-            disabled={isLoading || !input.trim()}
+            disabled={isLoading || !input.trim() || !llmService.isReady()}
             className="absolute right-2 top-1/2 -translate-y-1/2 p-2.5 rounded-full bg-violet-600 text-white disabled:bg-slate-400 dark:disabled:bg-slate-600 disabled:cursor-not-allowed hover:bg-violet-500 transition-colors"
           >
             <SendIcon className="w-5 h-5" />

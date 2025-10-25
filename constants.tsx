@@ -1,5 +1,5 @@
-import React from 'react';
-import type { Feature, LlmModelConfig, Language } from './types';
+﻿import React from 'react';
+import type { LlmModelMetadata, LlmModelConfig, Language, Feature } from './types';
 import { FeatureId } from './types';
 
 const LightbulbIcon = (props: React.ComponentProps<'svg'>) => (
@@ -16,7 +16,7 @@ const PenIcon = (props: React.ComponentProps<'svg'>) => (
 
 const SparklesIcon = (props: React.ComponentProps<'svg'>) => (
   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" {...props}>
-    <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a.375 .375 0 1 1-.75 0 .375 .375 0 0 1 .75 0Z" />
+    <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5H3.75A1.5 1.5 0 0 0 2.25 6v12a1.5 1.5 0 0 0 1.5 1.5Zm10.5-11.25h.008v.008h-.008V8.25Zm.375 0a .375 .375 0 1 1-.75 0 .375 .375 0 0 1 .75 0Z" />
   </svg>
 );
 
@@ -33,7 +33,7 @@ export const FEATURES: Feature[] = [
     id: FeatureId.CONTENT_POLISHER,
     title: 'Content Polisher',
     description: 'Refine your writing for clarity, tone, and impact. Enhance your message effortlessly.',
-    systemInstruction: 'You are Lumina, an expert editor with a keen eye for detail. Your task is to polish the user's text. Improve clarity, fix grammatical errors, adjust the tone as needed, and enhance the overall impact, while preserving the original meaning.',
+    systemInstruction: 'You are Lumina, an expert editor with a keen eye for detail. Your task is to polish the user text. Improve clarity, fix grammatical errors, adjust the tone as needed, and enhance the overall impact, while preserving the original meaning.',
     icon: PenIcon,
     placeholder: 'Paste your text here to refine it...'
   },
@@ -41,7 +41,7 @@ export const FEATURES: Feature[] = [
     id: FeatureId.VISION_WEAVER,
     title: 'Vision Weaver',
     description: 'Transform a simple concept into a rich, descriptive scene or narrative.',
-    systemInstruction: 'You are Lumina, a master storyteller and world-builder. Your purpose is to take a user's concept and weave it into a vivid, multi-sensory description. Evoke imagery, sounds, smells, and emotions to bring their vision to life.',
+    systemInstruction: 'You are Lumina, a master storyteller and world-builder. Your purpose is to take a user concept and weave it into a vivid, multi-sensory description. Evoke imagery, sounds, smells, and emotions to bring their vision to life.',
     icon: SparklesIcon,
     placeholder: 'Describe a scene, e.g., a futuristic city market at dawn...'
   }
@@ -51,47 +51,46 @@ export const MODELS: LlmModelConfig[] = [
   {
     id: 'phi-3.5-mini-instruct-q6_k',
     displayName: 'Phi-3.5 Mini Instruct (Q6_K)',
-    size: '3.14 GB',
     url: 'https://huggingface.co/microsoft/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q6_K.gguf',
-    sizeBytes: 3140000000,
-    sha256: '0259452056e3bafd4d01dac0ae6cc2b8ec11001361701945662c0f749e0fd0ba'
+    sha256: '0259452056e3bafd4d01dac0ae6cc2b8ec11001361701945662c0f749e0fd0ba',
+    size: '~2.3 GB',
+    sizeBytes: 2461204480
   },
   {
     id: 'gemma-2b-q6_k',
     displayName: 'Gemma 2B (Q6_K)',
-    size: '2.06 GB',
     url: 'https://huggingface.co/brittlewis12/gemma-2b-GGUF/resolve/main/gemma-2b.Q6_K.gguf',
-    sizeBytes: 2060000000,
-    sha256: 'e3a4304663a6151abfc66147454678763c43991ddb1a77eba6c5fe6acc96b1a5'
+    sha256: 'e3a4304663a6151abfc66147454678763c43991ddb1a77eba6c5fe6acc96b1a5',
+    size: '~1.7 GB',
+    sizeBytes: 1825361920
   },
   {
     id: 'llama-2-7b-q8_0',
     displayName: 'Llama 2 (7B Q8_0)',
-    size: '7.16 GB',
     url: 'https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q8_0.gguf',
-    sizeBytes: 7160000000,
-    sha256: 'f1415d117f94261fd9869ac5dabd98b3dc36648cfb7c6d84e5b473aca74ab64d'
+    sha256: 'f1415d117f94261fd9869ac5dabd98b3dc36648cfb7c6d84e5b473aca74ab64d',
+    size: '~7.2 GB',
+    sizeBytes: 7730000000
   },
   {
     id: 'mistral-7b-instruct-v0.3-q6_k',
     displayName: 'Mistral 7B Instruct v0.3 (Q6_K)',
-    size: '5.95 GB',
     url: 'https://huggingface.co/MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3.Q6_K.gguf',
-    sizeBytes: 5950000000,
-    sha256: 'd58a20f828bca2e163342d43324f953f2edf9bdd5886bfe15c4b81b5b70a3b7b'
+    sha256: 'd58a20f828bca2e163342d43324f953f2edf9bdd5886bfe15c4b81b5b70a3b7b',
+    size: '~5.9 GB',
+    sizeBytes: 6334000000
   }
 ];
 
 export const LOCAL_MODEL_CONFIG: LlmModelConfig = {
   id: 'local-model',
   displayName: 'Local Model',
-  size: 'Custom',
   url: '',
-  sizeBytes: 0,
-  sha256: 'n/a'
+  sha256: 'n/a',
+  size: 'Variable',
+  sizeBytes: 0
 };
 
-// Completa o export final (estava cortado como "export const LANGU")
 export const LANGUAGES: Language[] = [
   { id: 'en', label: 'English' },
   { id: 'pt', label: 'Português' },

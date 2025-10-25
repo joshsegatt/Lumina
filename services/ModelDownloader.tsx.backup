@@ -1,0 +1,1002 @@
+import RNFS from 'react-native-fs';
+import { sha256 } from 'react-native-sha256';
+import { MODELS } from '../constants';
+import type { LlmModelMetadata } from '../types';
+
+/**
+ * Flag para escolher método de download
+ * React Native precisa usar RNFS.downloadFile() pois não suporta ReadableStream
+ */
+const USE_RNFS_DOWNLOAD = true;
+
+/**
+ * Retorna o diretório de modelos, com fallback para TemporaryDirectoryPath
+ */
+const getModelDir = async (): Promise<string> => {
+  const primaryDir = `${RNFS.DocumentDirectoryPath}/models`;
+  const fallbackDir = `${RNFS.TemporaryDirectoryPath}/models`;
+
+  try {
+    // Tenta criar e validar o diretório primário
+    await RNFS.mkdir(primaryDir);
+    console.log(`[Downloader] Using primary directory: ${primaryDir}`);
+    return primaryDir;
+  } catch (error: any) {
+    console.warn(`[Downloader] Primary directory failed (${error.message}), trying fallback...`);
+    try {
+      await RNFS.mkdir(fallbackDir);
+      console.log(`[Downloader] Using fallback directory: ${fallbackDir}`);
+      return fallbackDir;
+    } catch (fallbackError: any) {
+      console.error(`[Downloader] Fallback directory also failed: ${fallbackError.message}`);
+      throw new Error(`Cannot create models directory: ${fallbackError.message}`);
+    }
+  }
+};
+
+/**
+ * Escreve dados binários diretamente em arquivo usando fetch streaming
+ * CRÍTICO: RNFS.appendFile() tem limitações com arquivos grandes (>2GB)
+ * e adiciona overhead de conversão base64 (~33% mais memória).
+ * 
+ * TODO: Considere react-native-blob-util para escrita binária direta.
+ * Por enquanto, usamos RNFS com base64 como única opção disponível.
+ */
+const writeBinaryChunk = async (
+  filePath: string,
+  data: Uint8Array,
+  append: boolean
+): Promise<void> => {
+  try {
+    // RNFS requer base64 - não há API para escrever Uint8Array diretamente
+    const base64Data = Buffer.from(data).toString('base64');
+    
+    if (append) {
+      await RNFS.appendFile(filePath, base64Data, 'base64');
+    } else {
+      await RNFS.writeFile(filePath, base64Data, 'base64');
+    }
+    
+    // Força flush: Aguarda confirmação da escrita
+    // Isso é crítico para evitar SHA256 prematuro
+    await new Promise(resolve => setImmediate(resolve));
+    
+  } catch (error: any) {
+    console.error('[Downloader] Failed to write binary chunk:', {
+      message: error.message,
+      fileSize: data.length,
+      append,
+      details: JSON.stringify(error, null, 2)
+    });
+    throw new Error(`Failed to write binary chunk: ${error.message}`);
+  }
+};
+
+/**
+ * Download usando RNFS.downloadFile() nativo do React Native
+ * CORRIGIDO: React Native NÃO suporta fetch().body.getReader()!
+ * 
+ * Este método usa a API nativa que funciona corretamente em RN.
+ */
+const downloadWithRNFS = async (
+  url: string,
+  filePath: string,
+  totalSize: number,
+  onProgress: (progress: number, bytesDownloaded: number) => void,
+  hfToken?: string
+): Promise<number> => {
+  console.log('[Downloader] Using RNFS.downloadFile() method (React Native native)');
+  console.log(`[Downloader]   - Target: ${filePath}`);
+  console.log(`[Downloader]   - Expected size: ${(totalSize / 1024 / 1024).toFixed(2)} MB`);
+  
+  const headers: Record<string, string> = {
+    'User-Agent': 'Lumina-App/1.0'
+  };
+  
+  if (hfToken) {
+    headers['Authorization'] = `Bearer ${hfToken}`;
+    console.log('[Downloader]   - Using HF token authentication');
+  }
+  
+  try {
+    // Deleta arquivo existente se houver
+    if (await RNFS.exists(filePath)) {
+      await RNFS.unlink(filePath);
+      console.log('[Downloader]   - Deleted existing file');
+    }
+    
+    console.log('[Downloader] Starting RNFS download...');
+    const startTime = Date.now();
+    
+    const downloadResult = await RNFS.downloadFile({
+      fromUrl: url,
+      toFile: filePath,
+      headers,
+      background: false, // Não executar em background
+      discretionary: false, // Não esperar WiFi
+      cacheable: false, // Não cachear
+      progressInterval: 1000, // Atualiza progresso a cada 1s
+      progressDivider: 1,
+      begin: (res) => {
+        console.log('[Downloader] Download started:');
+        console.log(`[Downloader]   - Status: ${res.statusCode}`);
+        console.log(`[Downloader]   - Content-Length: ${res.contentLength}`);
+        console.log(`[Downloader]   - Headers:`, JSON.stringify(res.headers, null, 2));
+        
+        // Valida status code
+        if (res.statusCode !== 200) {
+          throw new Error(`HTTP ${res.statusCode}: Expected 200 OK`);
+        }
+        
+        // Valida Content-Type
+        const contentType = (res.headers?.['Content-Type'] || res.headers?.['content-type'] || '').toLowerCase();
+        if (contentType.includes('text/html') || contentType.includes('application/json')) {
+          throw new Error(
+            `Invalid Content-Type: ${contentType}\n` +
+            `Server returned error page instead of binary file.`
+          );
+        }
+      },
+      progress: (res) => {
+        const progress = totalSize > 0 ? (res.bytesWritten / totalSize) * 100 : 0;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = res.bytesWritten / elapsed / 1024 / 1024; // MB/s
+        
+        // Log a cada 5%
+        if (Math.floor(progress) % 5 === 0 && progress > 0) {
+          console.log(
+            `[Downloader] Progress: ${progress.toFixed(1)}% ` +
+            `(${(res.bytesWritten / 1024 / 1024).toFixed(1)}MB / ${(totalSize / 1024 / 1024).toFixed(1)}MB) ` +
+            `- ${speed.toFixed(2)} MB/s`
+          );
+        }
+        
+        onProgress(Math.floor(progress), res.bytesWritten);
+      }
+    }).promise;
+    
+    const duration = (Date.now() - startTime) / 1000;
+    const avgSpeed = downloadResult.bytesWritten / duration / 1024 / 1024;
+    
+    console.log('[Downloader] ✅ RNFS download completed');
+    console.log(`[Downloader]   - Status code: ${downloadResult.statusCode}`);
+    console.log(`[Downloader]   - Bytes written: ${(downloadResult.bytesWritten / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`[Downloader]   - Duration: ${duration.toFixed(2)}s`);
+    console.log(`[Downloader]   - Average speed: ${avgSpeed.toFixed(2)} MB/s`);
+    
+    // Valida resultado
+    if (downloadResult.statusCode !== 200) {
+      throw new Error(`Download failed with status ${downloadResult.statusCode}`);
+    }
+    
+    if (downloadResult.bytesWritten === 0) {
+      throw new Error('Download completed but file is empty (0 bytes)');
+    }
+    
+    return downloadResult.bytesWritten;
+    
+  } catch (error: any) {
+    console.error('[Downloader] RNFS download failed:', {
+      message: error.message,
+      code: error.code,
+      details: JSON.stringify(error, Object.getOwnPropertyNames(error), 2)
+    });
+    
+    // Cleanup arquivo parcial
+    try {
+      if (await RNFS.exists(filePath)) {
+        await RNFS.unlink(filePath);
+        console.log('[Downloader] Cleaned up partial download file');
+      }
+    } catch (cleanupError) {
+      console.warn('[Downloader] Cleanup failed:', cleanupError);
+    }
+    
+    throw error;
+  }
+};
+
+/**
+ * Calcula SHA256 do arquivo usando leitura em chunks (streaming) para evitar OutOfMemory.
+ * @param filePath Caminho do arquivo
+ * @returns Hash SHA256 em lowercase
+ */
+const calculateSha256Streaming = async (filePath: string): Promise<string> => {
+  console.log(`[Downloader] Calculating SHA256 (streaming) for ${filePath}...`);
+  
+  try {
+    const stat = await RNFS.stat(filePath);
+    const fileSize = Number(stat.size);
+    console.log(`[Downloader]   - File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
+
+    // Para arquivos pequenos (<100MB), usa método direto
+    if (fileSize < 100 * 1024 * 1024) {
+      console.log(`[Downloader]   - Using direct SHA256 calculation (file < 100MB)`);
+      const fileContent = await RNFS.readFile(filePath, 'base64');
+      const hash = await sha256(fileContent);
+      console.log(`[Downloader]   - Calculated SHA256: ${hash.toLowerCase()}`);
+      return hash.toLowerCase();
+    }
+
+    // Para arquivos grandes, lê em chunks de 10MB
+    console.log(`[Downloader]   - Using chunked SHA256 calculation (file >= 100MB)`);
+    const chunkSize = 10 * 1024 * 1024; // 10MB chunks
+    let position = 0;
+    let combinedData = '';
+
+    while (position < fileSize) {
+      const length = Math.min(chunkSize, fileSize - position);
+      const chunk = await RNFS.read(filePath, length, position, 'base64');
+      combinedData += chunk;
+      position += length;
+      
+      const progress = Math.floor((position / fileSize) * 100);
+      if (progress % 20 === 0) {
+        console.log(`[Downloader]   - SHA256 calculation progress: ${progress}%`);
+      }
+    }
+
+    const hash = await sha256(combinedData);
+    console.log(`[Downloader]   - Calculated SHA256: ${hash.toLowerCase()}`);
+    return hash.toLowerCase();
+  } catch (error: any) {
+    console.error(`[Downloader] SHA256 calculation failed:`, {
+      message: error.message,
+      code: error.code,
+      details: JSON.stringify(error, null, 2)
+    });
+    throw new Error(`SHA256 calculation failed: ${error.message}`);
+  }
+};
+
+
+/**
+ * Valida se a resposta HTTP contém dados binários válidos (não HTML/JSON)
+ */
+const validateBinaryResponse = (
+  response: Response,
+  context: string
+): void => {
+  const contentType = response.headers.get('content-type')?.toLowerCase() || '';
+  const statusCode = response.status;
+  
+  console.log(`[Downloader] ${context} - Response validation:`);
+  console.log(`[Downloader]   - Status: ${statusCode}`);
+  console.log(`[Downloader]   - Content-Type: ${contentType || '(not provided)'}`);
+  console.log(`[Downloader]   - Content-Length: ${response.headers.get('content-length') || '(not provided)'}`);
+  console.log(`[Downloader]   - Final URL: ${response.url}`);
+  
+  // Valida status code
+  if (statusCode === 200 || statusCode === 206) {
+    // OK
+  } else {
+    throw new Error(
+      `Invalid status code ${statusCode}. Expected 200 or 206.\n` +
+      `This usually means the server returned an error page instead of the file.`
+    );
+  }
+  
+  // Valida Content-Type (deve ser binário, não HTML/JSON/texto)
+  const validBinaryTypes = [
+    'application/octet-stream',
+    'binary/octet-stream',
+    'application/x-gzip',
+    'application/gzip',
+    'application/x-gguf', // GGUF específico
+  ];
+  
+  const invalidTextTypes = [
+    'text/html',
+    'text/plain',
+    'application/json',
+    'application/xml',
+    'text/xml'
+  ];
+  
+  // Verifica se é tipo inválido
+  const isInvalidType = invalidTextTypes.some(invalid => contentType.includes(invalid));
+  if (isInvalidType) {
+    throw new Error(
+      `Response is not binary! Content-Type: ${contentType}\n` +
+      `The server returned an HTML/JSON error page instead of the .gguf file.\n` +
+      `This is usually caused by:\n` +
+      `  1. Rate limiting (try adding Hugging Face token)\n` +
+      `  2. File not found (404)\n` +
+      `  3. Authentication required\n` +
+      `URL: ${response.url}`
+    );
+  }
+  
+  // Verifica se é tipo válido (se Content-Type foi fornecido)
+  if (contentType) {
+    const isValidType = validBinaryTypes.some(valid => contentType.includes(valid));
+    if (!isValidType) {
+      console.warn(
+        `[Downloader] ⚠️ Unexpected Content-Type: ${contentType}\n` +
+        `Expected one of: ${validBinaryTypes.join(', ')}\n` +
+        `Proceeding anyway, but this may fail.`
+      );
+    }
+  } else {
+    console.warn('[Downloader] ⚠️ No Content-Type header provided. Proceeding with caution.');
+  }
+};
+
+/**
+ * Detecta se o ArrayBuffer contém HTML/JSON em vez de dados binários
+ */
+const detectInvalidContent = (arrayBuffer: ArrayBuffer, maxBytesToCheck: number = 512): void => {
+  if (arrayBuffer.byteLength === 0) {
+    throw new Error('Response body is empty (0 bytes)');
+  }
+  
+  // Converte primeiros bytes para string para análise
+  const bytes = new Uint8Array(arrayBuffer.slice(0, Math.min(maxBytesToCheck, arrayBuffer.byteLength)));
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  
+  // Detecta HTML
+  const htmlPatterns = ['<!DOCTYPE', '<html', '<HTML', '<head', '<body', '<title'];
+  if (htmlPatterns.some(pattern => text.includes(pattern))) {
+    console.error(`[Downloader] HTML detected in response! First 512 bytes:`);
+    console.error(text);
+    throw new Error(
+      'Response contains HTML instead of binary data!\n' +
+      'The server returned an error page. Check logs for HTML content.'
+    );
+  }
+  
+  // Detecta JSON
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      JSON.parse(trimmed);
+      console.error(`[Downloader] JSON detected in response:`, trimmed);
+      throw new Error(
+        'Response contains JSON instead of binary data!\n' +
+        'The server returned an API error. Check logs for JSON content.'
+      );
+    } catch (e) {
+      // Não é JSON válido, prossegue
+    }
+  }
+  
+  console.log(`[Downloader]   - Content validation: OK (appears to be binary data)`);
+};
+
+
+/**
+ * Downloads a model file using MANUAL CHUNKED DOWNLOAD with STRICT VALIDATION.
+ * This version validates Content-Type and detects HTML/JSON error responses.
+ *
+ * @param modelId The ID of the model to download.
+ * @param onProgress A callback to report download progress.
+ * @param hfToken Optional Hugging Face authentication token to avoid rate limiting.
+ * @returns A promise that resolves with the local file path.
+ */
+export const downloadModel = async (
+  modelId: string,
+  onProgress?: (progress: number) => void,
+  hfToken?: string
+): Promise<string> => {
+  console.log(`[Downloader] ==================== DOWNLOAD START ====================`);
+  console.log(`[Downloader] Model ID: ${modelId}`);
+  
+  const modelMetadata: LlmModelMetadata | undefined = MODELS.find((m) => m.id === modelId);
+  if (!modelMetadata) {
+    const errorMsg = `Model with id "${modelId}" not found in MODELS array.`;
+    console.error(`[Downloader] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  const { url, sha256: expectedSha, displayName } = modelMetadata;
+  const fileName = url.split('/').pop();
+  if (!fileName) {
+    const errorMsg = 'Could not determine filename from URL.';
+    console.error(`[Downloader] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+
+  console.log(`[Downloader] Display Name: ${displayName}`);
+  console.log(`[Downloader] Source URL: ${url}`);
+  console.log(`[Downloader] Filename: ${fileName}`);
+  console.log(`[Downloader] Expected SHA256: ${expectedSha.toLowerCase()}`);
+
+  let modelDir: string;
+  try {
+    modelDir = await getModelDir();
+    console.log(`[Downloader] Models directory resolved: ${modelDir}`);
+  } catch (dirError: any) {
+    console.error(`[Downloader] Failed to resolve models directory:`, {
+      message: dirError.message,
+      details: JSON.stringify(dirError, null, 2)
+    });
+    throw dirError;
+  }
+
+  const filePath = `${modelDir}/${fileName}`;
+  console.log(`[Downloader] Target file path: ${filePath}`);
+
+  try {
+    // ============ 1. CHECK IF FILE EXISTS AND IS VALID ============
+    const fileExists = await RNFS.exists(filePath);
+    if (fileExists) {
+      console.log('[Downloader] File already exists locally. Validating...');
+      
+      try {
+        const stat = await RNFS.stat(filePath);
+        const existingFileSize = Number(stat.size);
+        console.log(`[Downloader]   - Existing file size: ${(existingFileSize / 1024 / 1024).toFixed(2)} MB`);
+        
+        if (existingFileSize === 0) {
+          console.warn('[Downloader]   - Existing file is empty (0 bytes). Deleting...');
+          await RNFS.unlink(filePath);
+        } else {
+          const existingFileSha = await calculateSha256Streaming(filePath);
+          if (existingFileSha === expectedSha.toLowerCase()) {
+            console.log('[Downloader] ✅ Existing file is valid! Skipping download.');
+            try {
+              onProgress?.(100);
+            } catch (callbackError) {
+              console.warn('[Downloader] onProgress callback error (non-fatal):', callbackError);
+            }
+            return filePath;
+          } else {
+            console.warn('[Downloader]   - SHA256 mismatch. Deleting corrupted file...');
+            console.warn(`[Downloader]     Expected: ${expectedSha.toLowerCase()}`);
+            console.warn(`[Downloader]     Got:      ${existingFileSha}`);
+            await RNFS.unlink(filePath);
+          }
+        }
+      } catch (validationError: any) {
+        console.error('[Downloader] Validation of existing file failed:', {
+          message: validationError.message,
+          details: JSON.stringify(validationError, null, 2)
+        });
+        console.warn('[Downloader] Deleting potentially corrupted file...');
+        await RNFS.unlink(filePath).catch(e => console.error('[Downloader] Unlink failed:', e));
+      }
+    }
+
+    // ============ 2. GET FILE SIZE USING HEAD REQUEST ============
+    console.log('[Downloader] Fetching file metadata with HEAD request...');
+    let totalSize = 0;
+    let supportsRangeRequests = false;
+    let finalUrl = url;
+    
+    try {
+      const headHeaders: HeadersInit = {
+        'User-Agent': 'Lumina-App/1.0'
+      };
+      
+      if (hfToken) {
+        headHeaders['Authorization'] = `Bearer ${hfToken}`;
+        console.log('[Downloader]   - Using Hugging Face authentication token');
+      }
+      
+      const headResponse = await fetch(url, { 
+        method: 'HEAD',
+        headers: headHeaders,
+        redirect: 'follow'
+      });
+      
+      console.log('[Downloader] HEAD response received:');
+      console.log(`[Downloader]   - Status: ${headResponse.status}`);
+      console.log(`[Downloader]   - Content-Type: ${headResponse.headers.get('content-type') || '(not provided)'}`);
+      console.log(`[Downloader]   - Content-Length: ${headResponse.headers.get('content-length') || '(not provided)'}`);
+      console.log(`[Downloader]   - Accept-Ranges: ${headResponse.headers.get('accept-ranges') || '(not provided)'}`);
+      console.log(`[Downloader]   - Final URL after redirects: ${headResponse.url}`);
+      
+      if (headResponse.status !== 200) {
+        throw new Error(
+          `HEAD request failed with status ${headResponse.status}.\n` +
+          `Expected 200 OK. This may indicate:\n` +
+          `  - File not found (404)\n` +
+          `  - Authentication required (401/403)\n` +
+          `  - Rate limiting (429)\n` +
+          `  - Server error (500+)`
+        );
+      }
+      
+      // Valida Content-Type no HEAD
+      const contentType = headResponse.headers.get('content-type')?.toLowerCase() || '';
+      if (contentType && (contentType.includes('text/html') || contentType.includes('application/json'))) {
+        throw new Error(
+          `HEAD request returned ${contentType} instead of binary.\n` +
+          `The URL may be incorrect or the file requires authentication.\n` +
+          `URL: ${headResponse.url}`
+        );
+      }
+      
+      finalUrl = headResponse.url;
+      
+      const contentLength = headResponse.headers.get('content-length');
+      const acceptRanges = headResponse.headers.get('accept-ranges');
+      
+      if (contentLength) {
+        totalSize = parseInt(contentLength, 10);
+        console.log(`[Downloader]   - ✅ Total file size: ${(totalSize / 1024 / 1024).toFixed(2)} MB (${totalSize} bytes)`);
+        
+        if (totalSize < 1024 * 1024) {
+          console.warn(
+            `[Downloader]   - ⚠️ File size suspiciously small: ${totalSize} bytes\n` +
+            `This may be an error page instead of the actual file.`
+          );
+        }
+      } else {
+        console.warn('[Downloader]   - ⚠️ Content-Length header not found, will download without size validation');
+      }
+      
+      supportsRangeRequests = acceptRanges === 'bytes';
+      console.log(`[Downloader]   - Supports range requests: ${supportsRangeRequests}`);
+      
+    } catch (headError: any) {
+      console.error('[Downloader] HEAD request failed:', {
+        message: headError.message,
+        details: JSON.stringify(headError, Object.getOwnPropertyNames(headError), 2)
+      });
+      console.warn('[Downloader] Will attempt direct download despite HEAD failure...');
+    }
+
+    // ============ 3. DOWNLOAD FILE ============
+    console.log('[Downloader] Starting download...');
+    console.log(`[Downloader]   - Method: RNFS Native Download`);
+    const downloadJobStartTime = Date.now();
+    let downloadedBytes = 0;
+
+    // Deleta arquivo parcial se existir
+    if (await RNFS.exists(filePath)) {
+      await RNFS.unlink(filePath);
+      console.log('[Downloader]   - Deleted existing partial file');
+    }
+
+    // Tenta download com RNFS nativo (compatível com React Native)
+    try {
+      console.log('[Downloader] Using RNFS.downloadFile (React Native native method)');
+      downloadedBytes = await downloadWithRNFS(
+        finalUrl,
+        filePath,
+        totalSize,
+        (progress: number, bytes: number) => {
+          try {
+            onProgress?.(progress);
+          } catch (callbackError) {
+            console.warn('[Downloader] onProgress callback error (non-fatal):', callbackError);
+          }
+        },
+        hfToken
+      );
+      
+      console.log('[Downloader] ✅ Download completed successfully');
+    } catch (downloadError: any) {
+      console.error('[Downloader] ⚠️ RNFS download failed:', {
+        message: downloadError.message,
+        details: JSON.stringify(downloadError, Object.getOwnPropertyNames(downloadError), 2)
+      });
+      
+      // FALLBACK: Tenta fetch completo (para arquivos menores ou última tentativa)
+      if (totalSize < 500 * 1024 * 1024) { // Apenas para arquivos < 500MB
+        console.log('[Downloader] 🔄 FALLBACK: Trying full fetch download (file < 500MB)...');
+        
+        try {
+          if (await RNFS.exists(filePath)) {
+            await RNFS.unlink(filePath);
+          }
+          
+          const downloadHeaders: Record<string, string> = {
+            'User-Agent': 'Lumina-App/1.0'
+          };
+          if (hfToken) downloadHeaders['Authorization'] = `Bearer ${hfToken}`;
+          
+          const fullResponse = await fetch(finalUrl, {
+            method: 'GET',
+            headers: downloadHeaders,
+            redirect: 'follow'
+          });
+          
+          if (fullResponse.status !== 200) {
+            throw new Error(`Full download failed: HTTP ${fullResponse.status}`);
+          }
+          
+          const arrayBuffer = await fullResponse.arrayBuffer();
+          const base64Data = Buffer.from(arrayBuffer).toString('base64');
+          
+          await RNFS.writeFile(filePath, base64Data, 'base64');
+          downloadedBytes = arrayBuffer.byteLength;
+          onProgress?.(100);
+          
+          console.log('[Downloader] ✅ Fallback full download succeeded');
+        } catch (fallbackError: any) {
+          console.error('[Downloader] ❌ All download methods failed');
+          throw new Error(
+            `Download failed after multiple attempts:\n` +
+            `1. RNFS native: ${downloadError.message}\n` +
+            `2. Fetch full: ${fallbackError.message}\n\n` +
+            `Suggestions:\n` +
+            `- Check internet connection\n` +
+            `- Verify Hugging Face token if using private models\n` +
+            `- Try downloading on WiFi (mobile data may have issues)\n` +
+            `- Free up device storage (need ${(totalSize / 1024 / 1024 / 1024).toFixed(2)}GB)`
+          );
+        }
+      } else {
+        // Arquivo muito grande para fallback
+        throw new Error(
+          `RNFS download failed for large file (${(totalSize / 1024 / 1024).toFixed(0)}MB):\n` +
+          `${downloadError.message}\n\n` +
+          `Suggestions:\n` +
+          `- Ensure stable internet connection\n` +
+          `- Free up device storage\n` +
+          `- Try downloading on WiFi`
+        );
+      }
+    }
+
+    const downloadDuration = ((Date.now() - downloadJobStartTime) / 1000).toFixed(2);
+    console.log(`[Downloader] Download completed in ${downloadDuration}s`);
+
+    // ============ 4. VALIDATE FILE SIZE ============
+    console.log('[Downloader] Validating downloaded file...');
+    const fileExistsAfterDownload = await RNFS.exists(filePath);
+    if (!fileExistsAfterDownload) {
+      throw new Error('File does not exist after download completed.');
+    }
+
+    const stat = await RNFS.stat(filePath);
+    const actualFileSize = Number(stat.size);
+          
+          downloadedBytes += arrayBuffer.byteLength;
+          const progress = Math.floor((downloadedBytes / totalSize) * 100);
+          
+          console.log(
+            `[Downloader]   - ✅ Chunk ${chunkNumber} saved successfully. Progress: ${progress}% ` +
+            `(${(downloadedBytes / 1024 / 1024).toFixed(1)}MB / ${(totalSize / 1024 / 1024).toFixed(1)}MB)`
+          );
+          
+          try {
+            onProgress?.(progress);
+          } catch (callbackError) {
+            console.warn('[Downloader] onProgress callback error (non-fatal):', callbackError);
+          }
+          
+        } catch (chunkError: any) {
+          console.error(`[Downloader] ❌ Chunk ${chunkNumber} download failed:`, {
+            message: chunkError.message,
+            code: chunkError.code,
+            details: JSON.stringify(chunkError, Object.getOwnPropertyNames(chunkError), 2)
+          });
+          throw new Error(`Chunk ${chunkNumber} failed: ${chunkError.message}`);
+        }
+      }
+      
+    } else {
+      // Fallback: download completo de uma vez (se servidor não suporta ranges)
+      console.log('[Downloader] Server does not support range requests OR size unknown.');
+      console.log('[Downloader] Attempting full file download...');
+      
+      try {
+        const fullResponse = await fetch(finalUrl, {
+          method: 'GET',
+          headers: downloadHeaders,
+          redirect: 'follow'
+        });
+        
+        // VALIDAÇÃO CRÍTICA #1: Status Code
+        if (fullResponse.status !== 200) {
+          throw new Error(
+            `Full download failed with status ${fullResponse.status}.\n` +
+            `Expected 200 OK.\n` +
+            `URL: ${fullResponse.url}`
+          );
+        }
+        
+        // VALIDAÇÃO CRÍTICA #2: Content-Type
+        validateBinaryResponse(fullResponse, 'Full download');
+        
+        // VALIDAÇÃO CRÍTICA #3: Content-Length
+        const fullContentLength = fullResponse.headers.get('content-length');
+        if (fullContentLength) {
+          const expectedSize = parseInt(fullContentLength, 10);
+          console.log(`[Downloader]   - Expected file size: ${(expectedSize / 1024 / 1024).toFixed(2)} MB`);
+          
+          if (expectedSize < 1024 * 1024) {
+            console.warn(
+              `[Downloader]   - ⚠️ File size suspiciously small: ${expectedSize} bytes\n` +
+              `This may be an error page instead of the actual file.`
+            );
+          }
+        }
+        
+        console.log('[Downloader]   - Receiving full file data...');
+        const arrayBuffer = await fullResponse.arrayBuffer();
+        
+        console.log(`[Downloader]   - ArrayBuffer size: ${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
+        
+        // VALIDAÇÃO CRÍTICA #4: Detectar HTML/JSON
+        detectInvalidContent(arrayBuffer);
+        
+        // VALIDAÇÃO CRÍTICA #5: Comparar tamanho se conhecido
+        if (fullContentLength) {
+          const expectedSize = parseInt(fullContentLength, 10);
+          if (arrayBuffer.byteLength !== expectedSize) {
+            throw new Error(
+              `File size mismatch!\n` +
+              `Content-Length: ${expectedSize} bytes\n` +
+              `ArrayBuffer: ${arrayBuffer.byteLength} bytes\n` +
+              `The download was truncated.`
+            );
+          }
+        }
+        
+        console.log('[Downloader]   - Converting to base64 and writing to disk...');
+        const fileData = Buffer.from(arrayBuffer).toString('base64');
+        await RNFS.writeFile(filePath, fileData, 'base64');
+        
+        downloadedBytes = arrayBuffer.byteLength;
+        console.log('[Downloader]   - ✅ Full file written successfully');
+        
+        try {
+          onProgress?.(100);
+        } catch (callbackError) {
+          console.warn('[Downloader] onProgress callback error (non-fatal):', callbackError);
+        }
+      } catch (fullDownloadError: any) {
+        console.error('[Downloader] ❌ Full download failed:', {
+          message: fullDownloadError.message,
+          code: fullDownloadError.code,
+          details: JSON.stringify(fullDownloadError, Object.getOwnPropertyNames(fullDownloadError), 2)
+        });
+        throw fullDownloadError;
+      }
+      } // fim else (método antigo RNFS)
+    } // fim else (USE_FETCH_STREAMING)
+
+    const downloadDuration = ((Date.now() - downloadJobStartTime) / 1000).toFixed(2);
+    console.log(`[Downloader] Download completed in ${downloadDuration}s`);
+
+    // ============ 4. VALIDATE FILE SIZE ============
+    console.log('[Downloader] Validating downloaded file...');
+    const fileExistsAfterDownload = await RNFS.exists(filePath);
+    if (!fileExistsAfterDownload) {
+      throw new Error('File does not exist after download completed.');
+    }
+
+    const stat = await RNFS.stat(filePath);
+    const actualFileSize = Number(stat.size);
+    console.log(`[Downloader]   - Actual file size on disk: ${(actualFileSize / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`[Downloader]   - Bytes downloaded: ${(downloadedBytes / 1024 / 1024).toFixed(2)} MB`);
+
+    if (actualFileSize === 0) {
+      throw new Error('Downloaded file is empty (0 bytes).');
+    }
+
+    if (totalSize > 0 && actualFileSize !== totalSize) {
+      console.warn(
+        `[Downloader] ⚠️ File size mismatch: disk=${actualFileSize} bytes, expected=${totalSize} bytes`
+      );
+      console.warn(`[Downloader] This may indicate a truncated or incomplete download.`);
+      throw new Error(`File size mismatch: expected ${totalSize} bytes, got ${actualFileSize} bytes`);
+    }
+
+    // ============ 5. VALIDATE SHA256 ============
+    console.log('[Downloader] Starting SHA256 integrity check...');
+    
+    // CRÍTICO: Força flush das escritas pendentes antes da validação
+    // Aguarda 1 segundo para garantir que RNFS completou todas as operações
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Verifica novamente o tamanho após aguardar flush
+    const statBeforeSha = await RNFS.stat(filePath);
+    const fileSizeBeforeSha = Number(statBeforeSha.size);
+    console.log(`[Downloader]   - File size before SHA256: ${(fileSizeBeforeSha / 1024 / 1024).toFixed(2)} MB`);
+    
+    if (totalSize > 0 && fileSizeBeforeSha !== totalSize) {
+      throw new Error(
+        `File incomplete before SHA256 validation.\n` +
+        `Expected: ${totalSize} bytes\n` +
+        `On disk: ${fileSizeBeforeSha} bytes\n` +
+        `Difference: ${totalSize - fileSizeBeforeSha} bytes missing`
+      );
+    }
+    
+    const sha256StartTime = Date.now();
+    const downloadedFileSha = await calculateSha256Streaming(filePath);
+    const sha256Duration = ((Date.now() - sha256StartTime) / 1000).toFixed(2);
+    
+    console.log(`[Downloader] SHA256 calculated in ${sha256Duration}s`);
+    console.log(`[Downloader]   - Expected: ${expectedSha.toLowerCase()}`);
+    console.log(`[Downloader]   - Actual:   ${downloadedFileSha}`);
+
+    if (downloadedFileSha !== expectedSha.toLowerCase()) {
+      await RNFS.unlink(filePath).catch(e => console.error('[Downloader] Cleanup failed:', e));
+      const errorMsg = 
+        `SHA256 mismatch for ${displayName}.\n` +
+        `Expected: ${expectedSha.toLowerCase()}\n` +
+        `Got:      ${downloadedFileSha}\n` +
+        `The downloaded file is corrupted or incorrect.`;
+      console.error(`[Downloader] ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+
+    console.log(`[Downloader] ✅ Download and validation successful!`);
+    console.log(`[Downloader] ==================== DOWNLOAD END ====================`);
+    return filePath;
+
+  } catch (error: any) {
+    console.error('[Downloader] ==================== DOWNLOAD FAILED ====================');
+    console.error('[Downloader] Error details:', {
+      message: error.message,
+      code: error.code,
+      statusCode: error.statusCode,
+      name: error.name,
+      stack: error.stack,
+      fullError: JSON.stringify(error, Object.getOwnPropertyNames(error), 2)
+    });
+    
+    // Cleanup partial file on error
+    try {
+      const fileExistsOnError = await RNFS.exists(filePath);
+      if (fileExistsOnError) {
+        console.log('[Downloader] Cleaning up partial/corrupted file...');
+        await RNFS.unlink(filePath);
+        console.log('[Downloader] Cleanup successful.');
+      }
+    } catch (cleanupError: any) {
+      console.error('[Downloader] Cleanup failed:', {
+        message: cleanupError.message,
+        details: JSON.stringify(cleanupError, null, 2)
+      });
+    }
+    
+    throw error; // Re-throw to caller
+  }
+};
+
+
+
+/**
+ * Retorna o diretório onde os modelos são armazenados
+ */
+export const getModelsDirectory = async (): Promise<string> => {
+  return await getModelDir();
+};
+
+/**
+ * Lista todos os modelos baixados localmente
+ */
+export const listDownloadedModels = async (): Promise<string[]> => {
+  try {
+    const modelDir = await getModelDir();
+    const dirExists = await RNFS.exists(modelDir);
+    if (!dirExists) {
+      return [];
+    }
+    const files = await RNFS.readDir(modelDir);
+    return files.filter(file => file.name.endsWith('.gguf')).map(file => file.path);
+  } catch (error) {
+    console.error('[Downloader] Error listing models:', error);
+    return [];
+  }
+};
+
+/**
+ * Interface para resultado de validação
+ */
+export interface ModelValidationResult {
+  isValid: boolean;
+  exists: boolean;
+  sizeMatch: boolean;
+  hashMatch: boolean;
+  actualSize?: number;
+  expectedSize?: number;
+  actualHash?: string;
+  expectedHash?: string;
+  errorMessage?: string;
+}
+
+/**
+ * Valida se um modelo está realmente pronto para uso
+ * CRÍTICO: Deve ser chamado ANTES de inicializar o engine
+ * 
+ * @param filePath Caminho completo do arquivo .gguf
+ * @param expectedSize Tamanho esperado em bytes (opcional)
+ * @param expectedHash SHA256 esperado em lowercase (opcional)
+ * @returns Resultado detalhado da validação
+ */
+export const ensureModelReady = async (
+  filePath: string,
+  expectedSize?: number,
+  expectedHash?: string
+): Promise<ModelValidationResult> => {
+  console.log('[Validator] ==================== MODEL VALIDATION START ====================');
+  console.log(`[Validator] File path: ${filePath}`);
+  console.log(`[Validator] Expected size: ${expectedSize ? (expectedSize / 1024 / 1024).toFixed(2) + ' MB' : 'not provided'}`);
+  console.log(`[Validator] Expected hash: ${expectedHash || 'not provided'}`);
+
+  const result: ModelValidationResult = {
+    isValid: false,
+    exists: false,
+    sizeMatch: false,
+    hashMatch: false,
+  };
+
+  try {
+    // Step 1: Verificar existência
+    console.log('[Validator] Step 1: Checking file existence...');
+    const fileExists = await RNFS.exists(filePath);
+    result.exists = fileExists;
+
+    if (!fileExists) {
+      result.errorMessage = `File does not exist at path: ${filePath}`;
+      console.error(`[Validator] ❌ ${result.errorMessage}`);
+      return result;
+    }
+    console.log('[Validator] ✅ File exists');
+
+    // Step 2: Verificar tamanho
+    console.log('[Validator] Step 2: Checking file size...');
+    const stat = await RNFS.stat(filePath);
+    const actualSize = Number(stat.size);
+    result.actualSize = actualSize;
+    result.expectedSize = expectedSize;
+
+    console.log(`[Validator]   - Actual size: ${(actualSize / 1024 / 1024).toFixed(2)} MB (${actualSize} bytes)`);
+
+    if (actualSize === 0) {
+      result.errorMessage = 'File is empty (0 bytes)';
+      console.error(`[Validator] ❌ ${result.errorMessage}`);
+      return result;
+    }
+
+    if (expectedSize && actualSize !== expectedSize) {
+      result.errorMessage = `Size mismatch: expected ${expectedSize} bytes, got ${actualSize} bytes (diff: ${Math.abs(expectedSize - actualSize)} bytes)`;
+      console.error(`[Validator] ❌ ${result.errorMessage}`);
+      return result;
+    }
+    
+    result.sizeMatch = true;
+    console.log('[Validator] ✅ File size valid');
+
+    // Step 3: Verificar SHA256 (se fornecido)
+    if (expectedHash) {
+      console.log('[Validator] Step 3: Calculating SHA256...');
+      const startTime = Date.now();
+      const actualHash = await calculateSha256Streaming(filePath);
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      
+      result.actualHash = actualHash;
+      result.expectedHash = expectedHash.toLowerCase();
+
+      console.log(`[Validator]   - Calculated in ${duration}s`);
+      console.log(`[Validator]   - Expected: ${result.expectedHash}`);
+      console.log(`[Validator]   - Actual:   ${actualHash}`);
+
+      if (actualHash !== result.expectedHash) {
+        result.errorMessage = `SHA256 mismatch: expected ${result.expectedHash}, got ${actualHash}`;
+        console.error(`[Validator] ❌ ${result.errorMessage}`);
+        return result;
+      }
+
+      result.hashMatch = true;
+      console.log('[Validator] ✅ SHA256 valid');
+    } else {
+      console.log('[Validator] Step 3: SHA256 validation skipped (no expected hash provided)');
+      result.hashMatch = true; // Consider valid if not checking
+    }
+
+    // Todas as validações passaram
+    result.isValid = true;
+    console.log('[Validator] ✅✅✅ Model validation PASSED - file is ready for use');
+    console.log('[Validator] ==================== MODEL VALIDATION END ====================');
+    return result;
+
+  } catch (error: any) {
+    result.errorMessage = `Validation error: ${error.message || error}`;
+    console.error('[Validator] ❌ Validation failed:', {
+      message: error.message,
+      details: JSON.stringify(error, Object.getOwnPropertyNames(error), 2)
+    });
+    console.log('[Validator] ==================== MODEL VALIDATION END ====================');
+    return result;
+  }
+};
+
